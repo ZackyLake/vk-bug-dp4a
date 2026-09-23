@@ -1,0 +1,25 @@
+# CMake build output and generated files
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Testing/
+
+# Compiled shader binaries
+*.spv
+
+# Visual Studio local state
+.vs/
+*.suo
+*.user
+*.VC.db
+*.VC.VC.opendb
+
+# Machine-specific CMake configuration
+CMakeUserPresets.json
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
