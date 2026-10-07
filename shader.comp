@@ -1,28 +1,35 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_integer_dot_product : require
+layout(local_size_x_id = 0) in;
 
-layout(local_size_x = 1) in;
+struct InputElement {
+    uint data;
+    uint8_t value;
+};
 
-layout(set = 0, binding = 0, std430) buffer ResultBuffer {
-    uint func1Result;
-    uint func2Result;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    InputElement inputs[];
+} inputBuffer;
+
+layout(set = 0, binding = 1, std430) buffer ResultBuffer {
+    uint8_t func1Result[16];
+    uint8_t func2Result[16];
 } results;
 
-layout(push_constant) uniform InputData {
-    uint val;
-} inputData;
-
-uint32_t func1(uint32_t val) {
-    const u8vec4 bits = unpack8(val);
-    return bits.x + uint8_t(8) * bits.y;
+uint8_t test_bit_to_get_high4(uint32_t dat, int idx, uint8_t val) {
+    const int32_t shift = idx == 2 ? int32_t(dat & 4u) : bool(dat & uint32_t(1 << idx)) ? 4 : 0;
+    return uint8_t(bitfieldExtract(uint32_t(val), shift, 4));
 }
-
-uint32_t func2(uint32_t val) {
-    return dotPacked4x8EXT(val, 0x00000801u);
+uint8_t test_bit_to_get_high4_2(uint32_t dat, int idx, uint8_t val) {
+    if (idx == 2) return (val >> (dat & uint32_t(4))) & uint8_t(0x0F);
+    return (val >> (bool(dat & uint32_t(1 << idx)) ? 4u : 0u)) & uint8_t(0x0F);
 }
 
 void main() {
-    results.func1Result = func1(inputData.val);
-    results.func2Result = func2(inputData.val);
+    const uint index = gl_GlobalInvocationID.x;
+    const uint dat = inputBuffer.inputs[index].data;
+    const uint8_t val = inputBuffer.inputs[index].value;
+    results.func1Result[index] = test_bit_to_get_high4(dat, 3, val);
+    results.func2Result[index] = test_bit_to_get_high4_2(dat, 6, val >> 8);
 }

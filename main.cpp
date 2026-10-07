@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -19,12 +20,23 @@
 namespace {
 
 constexpr std::uint32_t kPackedInput = 0x04030201u;
-constexpr std::uint32_t kPackedWeights = 0x00000801u;
-constexpr VkDeviceSize kResultBufferSize = 2 * sizeof(std::uint32_t);
+constexpr std::size_t kInvocationCount = 16;
+constexpr std::uint32_t kRequiredSubgroupSize = 16;
+constexpr VkDeviceSize kInputElementStride = 8;
+constexpr VkDeviceSize kInputBufferSize = kInvocationCount * kInputElementStride;
+constexpr VkDeviceSize kResultBufferSize = 2 * kInvocationCount * sizeof(std::uint8_t);
+
+struct InputElement {
+    std::uint32_t data;
+    std::uint8_t value;
+    std::array<std::uint8_t, 3> padding{};
+};
+
+static_assert(sizeof(InputElement) == kInputElementStride);
 
 struct ExpectedResults {
-    std::uint32_t func1;
-    std::uint32_t func2;
+    std::array<std::uint8_t, kInvocationCount> func1;
+    std::array<std::uint8_t, kInvocationCount> func2;
 };
 
 std::array<std::uint32_t, 4> unpackBytes(std::uint32_t packed) {
@@ -35,27 +47,27 @@ std::array<std::uint32_t, 4> unpackBytes(std::uint32_t packed) {
         (packed >> 24) & 0xffu};
 }
 
-ExpectedResults printInputAndExpectedResults() {
-    const auto inputBytes = unpackBytes(kPackedInput);
-    const auto weightBytes = unpackBytes(kPackedWeights);
-    const std::uint32_t expectedFunc1 = inputBytes[0] + 8u * inputBytes[1];
-    std::uint32_t dotProduct = 0;
-    for (std::size_t componentIndex = 0; componentIndex < inputBytes.size(); ++componentIndex) {
-        dotProduct += inputBytes[componentIndex] * weightBytes[componentIndex];
+std::array<InputElement, kInvocationCount> makeInputData() {
+    std::array<InputElement, kInvocationCount> input{};
+    for (std::size_t index = 0; index < kInvocationCount; ++index) {
+        input[index].data = kPackedInput + static_cast<std::uint32_t>(index);
+        input[index].value = static_cast<std::uint8_t>(0x10u + index);
     }
-    const std::uint32_t expectedFunc2 = dotProduct;
+    return input;
+}
 
-    std::cout << "packed = 0x" << std::hex << std::setw(8) << std::setfill('0')
-              << kPackedInput << std::dec << std::setfill(' ') << " = u8["
-              << inputBytes[0] << ", " << inputBytes[1] << ", "
-              << inputBytes[2] << ", " << inputBytes[3] << "]\n"
-              << "dp4a with 0x" << std::hex << std::setw(8) << std::setfill('0')
-              << kPackedWeights << std::dec << std::setfill(' ') << " = u8["
-              << weightBytes[0] << ", " << weightBytes[1] << ", "
-              << weightBytes[2] << ", " << weightBytes[3] << "]\n"
-              << "expected = " << expectedFunc1 << '\n';
-
-    return {expectedFunc1, expectedFunc2};
+ExpectedResults makeExpectedResults(const std::array<InputElement, kInvocationCount>& input) {
+    ExpectedResults expected{};
+    for (std::size_t index = 0; index < kInvocationCount; ++index) {
+        const std::uint32_t data = input[index].data;
+        const std::uint8_t value = input[index].value;
+        const std::uint32_t func1Shift = (data & (1u << 3)) != 0 ? 4u : 0u;
+        const std::uint32_t func2Shift = (data & (1u << 6)) != 0 ? 4u : 0u;
+        expected.func1[index] = static_cast<std::uint8_t>((value >> func1Shift) & 0x0fu);
+        expected.func2[index] = static_cast<std::uint8_t>(
+            (static_cast<std::uint32_t>(value) >> 8 >> func2Shift) & 0x0fu);
+    }
+    return expected;
 }
 
 void checkVk(VkResult result, const char* operation) {
@@ -151,8 +163,14 @@ public:
             if (resultBuffer != VK_NULL_HANDLE) {
                 vkDestroyBuffer(device, resultBuffer, nullptr);
             }
+            if (inputBuffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(device, inputBuffer, nullptr);
+            }
             if (resultMemory != VK_NULL_HANDLE) {
                 vkFreeMemory(device, resultMemory, nullptr);
+            }
+            if (inputMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(device, inputMemory, nullptr);
             }
             vkDestroyDevice(device, nullptr);
         }
@@ -173,9 +191,11 @@ public:
             throw std::runtime_error("This shader requires a Vulkan 1.2 device");
         }
 
-        const ExpectedResults expected = printInputAndExpectedResults();
+        const auto input = makeInputData();
+        const ExpectedResults expected = makeExpectedResults(input);
         queueFamilyIndex = findComputeQueueFamily();
         createDevice(properties);
+        createInputBuffer(input);
         createResultBuffer();
         createDescriptorResources();
         createPipeline();
@@ -183,17 +203,13 @@ public:
     }
 
 private:
-    struct PushConstants {
-        std::uint32_t val;
-    };
-
-    static_assert(sizeof(PushConstants) == sizeof(std::uint32_t));
-
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queueFamilyIndex = 0;
+    VkBuffer inputBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory inputMemory = VK_NULL_HANDLE;
     VkBuffer resultBuffer = VK_NULL_HANDLE;
     VkDeviceMemory resultMemory = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
@@ -256,27 +272,52 @@ private:
                     "Selected device lacks VK_KHR_shader_integer_dot_product");
             }
             enabledExtensions.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+            if (!hasDeviceExtension(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+                throw std::runtime_error(
+                    "Selected device lacks VK_EXT_subgroup_size_control");
+            }
+            enabledExtensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
         }
 
         VkPhysicalDeviceShaderIntegerDotProductFeatures dotProductFeatures{};
         dotProductFeatures.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
 
+        VkPhysicalDeviceSubgroupSizeControlFeatures subgroupFeatures{};
+        subgroupFeatures.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+        subgroupFeatures.pNext = &dotProductFeatures;
+
         VkPhysicalDeviceVulkan12Features vulkan12Features{};
         vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        vulkan12Features.pNext = &dotProductFeatures;
+        vulkan12Features.pNext = &subgroupFeatures;
 
         VkPhysicalDeviceFeatures2 supportedFeatures{};
         supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         supportedFeatures.pNext = &vulkan12Features;
         vkGetPhysicalDeviceFeatures2(physicalDevice, &supportedFeatures);
 
-        if (!vulkan12Features.shaderInt8 || !dotProductFeatures.shaderIntegerDotProduct) {
+        if (!vulkan12Features.shaderInt8 || !dotProductFeatures.shaderIntegerDotProduct ||
+            !subgroupFeatures.subgroupSizeControl) {
             throw std::runtime_error(
-            "Selected device lacks shaderInt8 or integer dot-product support");
+                "Selected device lacks shaderInt8, integer dot-product, or subgroup-size support");
         }
         vulkan12Features.shaderInt8 = VK_TRUE;
         dotProductFeatures.shaderIntegerDotProduct = VK_TRUE;
+        subgroupFeatures.subgroupSizeControl = VK_TRUE;
+
+        VkPhysicalDeviceSubgroupSizeControlProperties subgroupProperties{};
+        subgroupProperties.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+        VkPhysicalDeviceProperties2 properties2{};
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties2.pNext = &subgroupProperties;
+        vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
+        if (kRequiredSubgroupSize < subgroupProperties.minSubgroupSize ||
+            kRequiredSubgroupSize > subgroupProperties.maxSubgroupSize ||
+            (subgroupProperties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
+            throw std::runtime_error("Selected device cannot require compute subgroup size 16");
+        }
 
         const float queuePriority = 1.0f;
         VkDeviceQueueCreateInfo queueInfo{};
@@ -316,6 +357,31 @@ private:
         throw std::runtime_error("No host-visible coherent memory type found");
     }
 
+    void createInputBuffer(const std::array<InputElement, kInvocationCount>& input) {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = kInputBufferSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        checkVk(vkCreateBuffer(device, &bufferInfo, nullptr, &inputBuffer), "vkCreateBuffer");
+
+        VkMemoryRequirements memoryRequirements{};
+        vkGetBufferMemoryRequirements(device, inputBuffer, &memoryRequirements);
+        VkMemoryAllocateInfo allocationInfo{};
+        allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocationInfo.allocationSize = memoryRequirements.size;
+        allocationInfo.memoryTypeIndex = findHostCoherentMemoryType(memoryRequirements.memoryTypeBits);
+        checkVk(vkAllocateMemory(device, &allocationInfo, nullptr, &inputMemory),
+                "vkAllocateMemory");
+        checkVk(vkBindBufferMemory(device, inputBuffer, inputMemory, 0), "vkBindBufferMemory");
+
+        void* mappedMemory = nullptr;
+        checkVk(vkMapMemory(device, inputMemory, 0, kInputBufferSize, 0, &mappedMemory),
+                "vkMapMemory");
+        std::memcpy(mappedMemory, input.data(), static_cast<std::size_t>(kInputBufferSize));
+        vkUnmapMemory(device, inputMemory);
+    }
+
     void createResultBuffer() {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -335,23 +401,27 @@ private:
     }
 
     void createDescriptorResources() {
-        VkDescriptorSetLayoutBinding storageBinding{};
-        storageBinding.binding = 0;
-        storageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        storageBinding.descriptorCount = 1;
-        storageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        std::array<VkDescriptorSetLayoutBinding, 2> storageBindings{};
+        storageBindings[0].binding = 0;
+        storageBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        storageBindings[0].descriptorCount = 1;
+        storageBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        storageBindings[1].binding = 1;
+        storageBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        storageBindings[1].descriptorCount = 1;
+        storageBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &storageBinding;
+        layoutInfo.bindingCount = static_cast<std::uint32_t>(storageBindings.size());
+        layoutInfo.pBindings = storageBindings.data();
         checkVk(vkCreateDescriptorSetLayout(
                     device, &layoutInfo, nullptr, &descriptorSetLayout),
                 "vkCreateDescriptorSetLayout");
 
         VkDescriptorPoolSize poolSize{};
         poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 1;
+        poolSize.descriptorCount = 2;
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.maxSets = 1;
@@ -368,18 +438,22 @@ private:
         checkVk(vkAllocateDescriptorSets(device, &allocateInfo, &descriptorSet),
                 "vkAllocateDescriptorSets");
 
-        VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = resultBuffer;
-        bufferInfo.offset = 0;
-        bufferInfo.range = kResultBufferSize;
-        VkWriteDescriptorSet writeInfo{};
-        writeInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writeInfo.dstSet = descriptorSet;
-        writeInfo.dstBinding = 0;
-        writeInfo.descriptorCount = 1;
-        writeInfo.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writeInfo.pBufferInfo = &bufferInfo;
-        vkUpdateDescriptorSets(device, 1, &writeInfo, 0, nullptr);
+        std::array<VkDescriptorBufferInfo, 2> bufferInfos{};
+        bufferInfos[0].buffer = inputBuffer;
+        bufferInfos[0].range = kInputBufferSize;
+        bufferInfos[1].buffer = resultBuffer;
+        bufferInfos[1].range = kResultBufferSize;
+        std::array<VkWriteDescriptorSet, 2> writeInfos{};
+        for (std::size_t binding = 0; binding < writeInfos.size(); ++binding) {
+            writeInfos[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writeInfos[binding].dstSet = descriptorSet;
+            writeInfos[binding].dstBinding = static_cast<std::uint32_t>(binding);
+            writeInfos[binding].descriptorCount = 1;
+            writeInfos[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writeInfos[binding].pBufferInfo = &bufferInfos[binding];
+        }
+        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writeInfos.size()),
+                               writeInfos.data(), 0, nullptr);
     }
 
     std::vector<std::uint32_t> loadShader() const {
@@ -411,16 +485,10 @@ private:
         checkVk(vkCreateShaderModule(device, &shaderInfo, nullptr, &shaderModule),
                 "vkCreateShaderModule");
 
-        VkPushConstantRange pushConstantRange{};
-        pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pushConstantRange.offset = 0;
-        pushConstantRange.size = sizeof(PushConstants);
         VkPipelineLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         layoutInfo.setLayoutCount = 1;
         layoutInfo.pSetLayouts = &descriptorSetLayout;
-        layoutInfo.pushConstantRangeCount = 1;
-        layoutInfo.pPushConstantRanges = &pushConstantRange;
         checkVk(vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout),
                 "vkCreatePipelineLayout");
 
@@ -429,6 +497,22 @@ private:
         stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         stageInfo.module = shaderModule;
         stageInfo.pName = "main";
+        std::uint32_t localSizeX = kRequiredSubgroupSize;
+        VkSpecializationMapEntry localSizeEntry{};
+        localSizeEntry.constantID = 0;
+        localSizeEntry.offset = 0;
+        localSizeEntry.size = sizeof(localSizeX);
+        VkSpecializationInfo specializationInfo{};
+        specializationInfo.mapEntryCount = 1;
+        specializationInfo.pMapEntries = &localSizeEntry;
+        specializationInfo.dataSize = sizeof(localSizeX);
+        specializationInfo.pData = &localSizeX;
+        stageInfo.pSpecializationInfo = &specializationInfo;
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSizeInfo{};
+        subgroupSizeInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+        subgroupSizeInfo.requiredSubgroupSize = kRequiredSubgroupSize;
+        stageInfo.pNext = &subgroupSizeInfo;
         VkComputePipelineCreateInfo pipelineInfo{};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         pipelineInfo.stage = stageInfo;
@@ -462,9 +546,6 @@ private:
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-        const PushConstants pushConstants{kPackedInput};
-        vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(pushConstants), &pushConstants);
         vkCmdDispatch(commandBuffer, 1, 1, 1);
 
         VkBufferMemoryBarrier hostReadBarrier{};
@@ -492,20 +573,16 @@ private:
         void* mappedMemory = nullptr;
         checkVk(vkMapMemory(device, resultMemory, 0, kResultBufferSize, 0, &mappedMemory),
                 "vkMapMemory");
-        const auto* values = static_cast<const std::uint32_t*>(mappedMemory);
-        const std::uint32_t firstResult = values[0];
-        const std::uint32_t secondResult = values[1];
+        const auto* values = static_cast<const std::uint8_t*>(mappedMemory);
         vkUnmapMemory(device, resultMemory);
 
-        const bool func1Matches = firstResult == expected.func1;
-        const bool func2Matches = secondResult == expected.func2;
-        const bool resultsMatch =
-            func1Matches && func2Matches && firstResult == secondResult;
-        std::cout << "VK func1 (MULADD) = " << firstResult << " ("
-                  << (func1Matches ? "PASS" : "FAIL") << ")\n"
-                  << "VK func2 (DP4A) = " << secondResult << " ("
-                  << (func2Matches ? "PASS" : "FAIL") << ")\n"
-                  << (resultsMatch ? "MATCH" : "MISMATCH") << '\n';
+        bool resultsMatch = true;
+        for (std::size_t index = 0; index < kInvocationCount; ++index) {
+            const bool func1Matches = values[index] == expected.func1[index];
+            const bool func2Matches = values[kInvocationCount + index] == expected.func2[index];
+            resultsMatch = resultsMatch && func1Matches && func2Matches;
+        }
+        std::cout << "VK 16 invocations: " << (resultsMatch ? "MATCH" : "MISMATCH") << '\n';
         return resultsMatch;
     }
 };
